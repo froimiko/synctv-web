@@ -1,9 +1,9 @@
-import { debounces } from "@/utils";
 import { useDebounceFn } from "@vueuse/core";
 import { type WatchStopHandle } from "vue";
 import { Message, MessageType, Status } from "@/proto/message";
 import Artplayer from "artplayer";
 import { ElNotification } from "element-plus";
+import { createPlaybackCoordinator } from "./syncPlayback";
 
 const artPlay = async (art: Artplayer) => {
   let retry = false;
@@ -77,8 +77,6 @@ export const newSyncPlugin = (
   dynamicCurrentExpireId: () => number
 ) => {
   return (art: Artplayer): syncPlugin => {
-    const playingStatusDebounce = debounces(debounceTime);
-
     let lastestSeek = 0;
 
     const publishSeek = () => {
@@ -118,66 +116,63 @@ export const newSyncPlugin = (
       art.currentTime = seek;
     };
 
-    const publishPlay = () => {
-      console.groupCollapsed("广播视频播放");
-      console.log("seek:", art.currentTime);
-      console.log("rate:", art.playbackRate);
-      console.log("playing:", !art.video.paused);
+    const publishPlaybackStatus = (status: Status) => {
+      console.groupCollapsed(status.isPlaying ? "广播视频播放" : "广播视频暂停");
+      console.log("seek:", status.currentTime);
+      console.log("rate:", status.playbackRate);
+      console.log("playing:", status.isPlaying);
       console.groupEnd();
       publishStatus(
         Message.create({
           type: MessageType.STATUS,
           timestamp: Date.now(),
-          playbackStatus: {
-            isPlaying: true,
-            currentTime: art.currentTime,
-            playbackRate: art.playbackRate
-          }
+          playbackStatus: status
         })
       );
     };
 
-    const publishPlayDebounce = playingStatusDebounce(publishPlay);
+    const currentStatus = (): Status => {
+      return {
+        isPlaying: !art.video.paused,
+        currentTime: art.currentTime,
+        playbackRate: art.playbackRate
+      };
+    };
+
+    const playbackCoordinator = createPlaybackCoordinator(
+      {
+        currentStatus,
+        play: async () => {
+          console.groupCollapsed("设置播放(非广播)");
+          console.log("seek:", art.currentTime);
+          console.log("rate:", art.playbackRate);
+          console.log("playing:", !art.video.paused);
+          console.groupEnd();
+          await artPlay(art);
+          return !art.video.paused;
+        },
+        pause: () => {
+          console.groupCollapsed("设置暂停(非广播)");
+          console.log("seek:", art.currentTime);
+          console.log("rate:", art.playbackRate);
+          console.log("playing:", !art.video.paused);
+          console.groupEnd();
+          art.video.pause();
+        },
+        publish: publishPlaybackStatus
+      },
+      debounceTime
+    );
+
+    const publishPlay = () => playbackCoordinator.handleMediaEvent(true);
+    const publishPause = () => playbackCoordinator.handleMediaEvent(false);
 
     const setAndNoPublishPlay = async () => {
-      if (!art.video.paused) return;
-      console.groupCollapsed("设置播放(非广播)");
-      console.log("seek:", art.currentTime);
-      console.log("rate:", art.playbackRate);
-      console.log("playing:", !art.video.paused);
-      console.groupEnd();
-      await artPlay(art);
+      await playbackCoordinator.applyRemote(true);
     };
-
-    const publishPause = () => {
-      console.groupCollapsed("广播视频暂停");
-      console.log("seek:", art.currentTime);
-      console.log("rate:", art.playbackRate);
-      console.log("playing:", !art.video.paused);
-      console.groupEnd();
-      publishStatus(
-        Message.create({
-          type: MessageType.STATUS,
-          timestamp: Date.now(),
-          playbackStatus: {
-            isPlaying: false,
-            currentTime: art.currentTime,
-            playbackRate: art.playbackRate
-          }
-        })
-      );
-    };
-
-    const publishPauseDebounce = playingStatusDebounce(publishPause);
 
     const setAndNoPublishPause = () => {
-      if (art.video.paused) return;
-      console.groupCollapsed("设置暂停(非广播)");
-      console.log("seek:", art.currentTime);
-      console.log("rate:", art.playbackRate);
-      console.log("playing:", !art.video.paused);
-      console.groupEnd();
-      art.video.pause();
+      playbackCoordinator.applyRemote(false);
     };
 
     const publishRate = () => {
@@ -264,17 +259,10 @@ export const newSyncPlugin = (
       status.isPlaying ? await setAndNoPublishPlay() : setAndNoPublishPause();
     };
 
-    const currentStatus = (): Status => {
-      return {
-        isPlaying: !art.video.paused,
-        currentTime: art.currentTime,
-        playbackRate: art.playbackRate
-      };
-    };
-
     const intervals: number[] = [];
     const watchers: WatchStopHandle[] = [];
     art.on("destroy", () => {
+      playbackCoordinator.destroy();
       intervals.forEach((interval) => {
         clearInterval(interval);
       });
@@ -301,10 +289,10 @@ export const newSyncPlugin = (
 
         newSyncControl(art, publishStatus);
 
-        art.on("play", publishPlayDebounce);
+        art.on("play", publishPlay);
 
         // 视频暂停
-        art.on("pause", publishPauseDebounce);
+        art.on("pause", publishPause);
 
         // 空降
         art.on("seek", publishSeekDebounce);
@@ -313,8 +301,8 @@ export const newSyncPlugin = (
         art.on("video:ratechange", publishRate);
 
         art.on("destroy", () => {
-          art.off("play", publishPlayDebounce);
-          art.off("pause", publishPauseDebounce);
+          art.off("play", publishPlay);
+          art.off("pause", publishPause);
           art.off("seek", publishSeekDebounce);
           art.off("video:ratechange", publishRate);
         });
