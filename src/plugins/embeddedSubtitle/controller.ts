@@ -26,7 +26,7 @@ export interface EmbeddedSubtitleSource {
 export type EmbeddedSubtitleFailureCode =
   | "open-failed"
   | "read-failed"
-  | "read-limit"
+  | "scan-budget"
   | "seek-failed";
 
 export interface EmbeddedSubtitleFailure {
@@ -56,6 +56,13 @@ export interface EmbeddedSubtitleControllerOptions {
   maxBytesScannedPerPump?: number;
   /** Hard all-packet demux budget across all session.read calls in one pump. */
   maxPacketsScannedPerPump?: number;
+  /**
+   * Cumulative logical IOReader byte budget across every pump of one demux
+   * session. Per-pump exhaustion only ends the current pump; this cumulative
+   * cap is the fatal runaway-download guard and resets whenever a new session
+   * is established or the source is invalidated.
+   */
+  maxBytesScannedPerSession?: number;
 }
 
 export interface EmbeddedSubtitleController {
@@ -88,7 +95,7 @@ interface ActivePump {
   promise: Promise<void>;
 }
 
-type EmbeddedSubtitleFailureKind = "open" | "read" | "readLimit" | "seek";
+type EmbeddedSubtitleFailureKind = "open" | "read" | "scanBudget" | "seek";
 
 const FAILURE_DETAILS: Record<EmbeddedSubtitleFailureKind, EmbeddedSubtitleFailure> = {
   open: {
@@ -99,8 +106,8 @@ const FAILURE_DETAILS: Record<EmbeddedSubtitleFailureKind, EmbeddedSubtitleFailu
     code: "read-failed",
     message: "Embedded subtitle data could not be read."
   },
-  readLimit: {
-    code: "read-limit",
+  scanBudget: {
+    code: "scan-budget",
     message: "Embedded subtitles were disabled because this file requires too much scanning."
   },
   seek: {
@@ -113,8 +120,16 @@ const DEFAULT_PREFETCH_SECONDS = 30;
 const DEFAULT_LOW_WATER_SECONDS = 10;
 const DEFAULT_RETAIN_BEHIND_SECONDS = 30;
 const DEFAULT_MAX_PACKETS_PER_PUMP = 128;
-const DEFAULT_MAX_BYTES_SCANNED_PER_PUMP = 8 * 1024 * 1024;
-const DEFAULT_MAX_PACKETS_SCANNED_PER_PUMP = 1024;
+// Matroska interleaves subtitle packets between video Clusters, so a sparse
+// dialogue stretch can legitimately separate two subtitle packets by many
+// megabytes of video data. Per-pump budgets only bound the work of one pump;
+// exhausting them is normal and non-fatal. For 4K sources a single video packet
+// can be hundreds of KB, so packet count is a poor cost proxy - bytes are the
+// meaningful boundary, and DEFAULT_MAX_BYTES_SCANNED_PER_SESSION below is the
+// actual runaway-download guard.
+const DEFAULT_MAX_BYTES_SCANNED_PER_PUMP = 24 * 1024 * 1024;
+const DEFAULT_MAX_PACKETS_SCANNED_PER_PUMP = 16384;
+const DEFAULT_MAX_BYTES_SCANNED_PER_SESSION = 512 * 1024 * 1024;
 
 function positiveFinite(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
@@ -172,6 +187,12 @@ export function createEmbeddedSubtitleController(
       positiveFinite(options.maxPacketsScannedPerPump, DEFAULT_MAX_PACKETS_SCANNED_PER_PUMP)
     )
   );
+  const maxBytesScannedPerSession = Math.max(
+    1,
+    Math.floor(
+      positiveFinite(options.maxBytesScannedPerSession, DEFAULT_MAX_BYTES_SCANNED_PER_SESSION)
+    )
+  );
 
   let source = options.source ?? null;
   let tracks: EmbeddedSubtitleTrack[] = [];
@@ -187,6 +208,7 @@ export function createEmbeddedSubtitleController(
   let rendererResidentCueKeys = new Set<string>();
   let authoritativeDurationKeys = new Set<string>();
   let scanHorizonSeconds = 0;
+  let sessionBytesScanned = 0;
 
   let reachedEnd = false;
 
@@ -372,6 +394,7 @@ export function createEmbeddedSubtitleController(
     const pendingPromise = cancelPendingOpen();
     const sessionCleanup = destroySession ? detachSession() : Promise.resolve();
     resetCueState(timestampSeconds);
+    sessionBytesScanned = 0;
     rendererClear();
     const pendingCleanup = pendingPromise
       ? pendingPromise.then(() => undefined).catch(() => undefined)
@@ -460,6 +483,7 @@ export function createEmbeddedSubtitleController(
         }
         const record = { session, abortController, source: openingSource };
         sessionRecord = record;
+        sessionBytesScanned = 0;
         return record;
       } catch (error) {
         // Failure cleanup must not await the promise currently executing this catch.
@@ -592,7 +616,9 @@ export function createEmbeddedSubtitleController(
       const remainingBytes = maxBytesScannedPerPump - bytesScanned;
       const remainingPackets = maxPacketsScannedPerPump - packetsScanned;
       if (remainingBytes <= 0 || remainingPackets <= 0) {
-        await disableForFailure("readLimit", token);
+        // Per-pump budget exhaustion is a normal sparse-dialogue event: end this
+        // pump only and let the next timeupdate resume from the demux position.
+        reconcileDelivery(referenceTimeSeconds, token);
         return;
       }
 
@@ -625,18 +651,27 @@ export function createEmbeddedSubtitleController(
       }
       bytesScanned = accumulatedProgress.bytesScanned;
       packetsScanned = accumulatedProgress.packetsScanned;
+      sessionBytesScanned += result.bytesScanned;
 
       if (result.status === "aborted") {
         await disableAfterAbort(token);
         return;
       }
-      if (result.status === "limit") {
-        await disableForFailure("readLimit", token);
-        return;
-      }
       if (result.status === "end") {
         flushPendingCue(token);
         reachedEnd = true;
+        reconcileDelivery(referenceTimeSeconds, token);
+        return;
+      }
+      if (sessionBytesScanned >= maxBytesScannedPerSession) {
+        // Cumulative session scanning is the real runaway-download guard and is
+        // the only scan-budget condition that disables embedded subtitles.
+        await disableForFailure("scanBudget", token);
+        return;
+      }
+      if (result.status === "limit") {
+        // Non-fatal: the demux session keeps its reader position, so the next
+        // pump continues forward instead of restarting.
         reconcileDelivery(referenceTimeSeconds, token);
         return;
       }

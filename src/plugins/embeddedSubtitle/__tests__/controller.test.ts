@@ -294,17 +294,18 @@ describe("embedded subtitle controller", () => {
     }
   );
 
-  it("turns a demux scan limit into a terminal sanitized read-limit failure", async () => {
+  it("keeps embedded subtitles enabled when a per-pump scan limit is reached", async () => {
     const subtitleTrack = track();
     const session = fakeSession(subtitleTrack, [
       limitResult({ bytesScanned: 64, packetsScanned: 6 })
     ]);
     const failures: EmbeddedSubtitleFailure[] = [];
+    const output = renderer();
     const openSession = vi.fn(async () => session);
     const controller = createEmbeddedSubtitleController({
       source: SOURCE_A,
       openSession,
-      renderer: renderer(),
+      renderer: output,
       getCurrentTime: () => 0,
       maxBytesScannedPerPump: 64,
       maxPacketsScannedPerPump: 6,
@@ -312,15 +313,122 @@ describe("embedded subtitle controller", () => {
     });
 
     await controller.discover();
-    await expect(controller.selectTrack(subtitleTrack.id)).resolves.toBe(false);
+    await expect(controller.selectTrack(subtitleTrack.id)).resolves.toBe(true);
 
     expect(session.read).toHaveBeenCalledWith(subtitleTrack.id, {
       maxBytesScanned: 64,
       maxPacketsScanned: 6
     });
+    expect(failures).toEqual([]);
+    expect(session.destroy).not.toHaveBeenCalled();
+    expect(controller.tracks).toEqual([subtitleTrack]);
+    expect(controller.selectedTrack).toEqual(subtitleTrack);
+    expect(output.setActive).toHaveBeenLastCalledWith(true);
+  });
+
+  it("resumes scanning on the next timeupdate after a per-pump scan limit", async () => {
+    const subtitleTrack = track();
+    const session = fakeSession(subtitleTrack, [
+      limitResult({ bytesScanned: 64, packetsScanned: 6 }),
+      packetResult(packet(subtitleTrack, { ptsSeconds: 2, text: "Resumed" })),
+      endResult()
+    ]);
+    const output = renderer();
+    let now = 0;
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession: vi.fn(async () => session),
+      renderer: output,
+      getCurrentTime: () => now,
+      maxBytesScannedPerPump: 64,
+      maxPacketsScannedPerPump: 6
+    });
+
+    await controller.discover();
+    await expect(controller.selectTrack(subtitleTrack.id)).resolves.toBe(true);
+    expect(session.read).toHaveBeenCalledTimes(1);
+    expect(output.add).not.toHaveBeenCalled();
+
+    now = 1;
+    await controller.handleTimeUpdate();
+
+    expect(session.read.mock.calls.length).toBeGreaterThan(1);
+    expect(output.add).toHaveBeenCalledWith(
+      expect.objectContaining({ startSeconds: 2, endSeconds: 4, text: "Resumed" })
+    );
+    expect(controller.selectedTrack).toEqual(subtitleTrack);
+  });
+
+  it("delivers a cue after a sparse stretch of exhausting reads", async () => {
+    const subtitleTrack = track();
+    const session = fakeSession(subtitleTrack, [
+      limitResult({ bytesScanned: 1000, packetsScanned: 4 }),
+      limitResult({ bytesScanned: 1000, packetsScanned: 4 }),
+      limitResult({ bytesScanned: 1000, packetsScanned: 4 }),
+      packetResult(packet(subtitleTrack, { ptsSeconds: 4, text: "Sparse" }), {
+        bytesScanned: 1000,
+        packetsScanned: 4
+      }),
+      endResult()
+    ]);
+    const output = renderer();
+    const failures: EmbeddedSubtitleFailure[] = [];
+    let now = 0;
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession: vi.fn(async () => session),
+      renderer: output,
+      getCurrentTime: () => now,
+      maxBytesScannedPerPump: 1000,
+      maxPacketsScannedPerPump: 4,
+      maxBytesScannedPerSession: 1_000_000,
+      onFailure: (failure) => failures.push(failure)
+    });
+
+    await controller.discover();
+    await expect(controller.selectTrack(subtitleTrack.id)).resolves.toBe(true);
+
+    for (let index = 1; index <= 4; index += 1) {
+      now = index;
+      await controller.handleTimeUpdate();
+    }
+
+    expect(failures).toEqual([]);
+    expect(controller.selectedTrack).toEqual(subtitleTrack);
+    expect(output.add).toHaveBeenCalledWith(
+      expect.objectContaining({ startSeconds: 4, endSeconds: 6, text: "Sparse" })
+    );
+  });
+
+  it("disables with a sanitized scan-budget failure when the session scan cap is exceeded", async () => {
+    const subtitleTrack = track();
+    const session = fakeSession(subtitleTrack, [
+      limitResult({ bytesScanned: 100, packetsScanned: 4 }),
+      limitResult({ bytesScanned: 100, packetsScanned: 4 })
+    ]);
+    const failures: EmbeddedSubtitleFailure[] = [];
+    let now = 0;
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession: vi.fn(async () => session),
+      renderer: renderer(),
+      getCurrentTime: () => now,
+      maxBytesScannedPerPump: 100,
+      maxPacketsScannedPerPump: 4,
+      maxBytesScannedPerSession: 150,
+      onFailure: (failure) => failures.push(failure)
+    });
+
+    await controller.discover();
+    await expect(controller.selectTrack(subtitleTrack.id)).resolves.toBe(true);
+    expect(failures).toEqual([]);
+
+    now = 1;
+    await controller.handleTimeUpdate();
+
     expect(failures).toEqual([
       {
-        code: "read-limit",
+        code: "scan-budget",
         message: "Embedded subtitles were disabled because this file requires too much scanning."
       }
     ]);
@@ -328,22 +436,58 @@ describe("embedded subtitle controller", () => {
     expect(session.destroy).toHaveBeenCalledTimes(1);
     expect(controller.tracks).toEqual([]);
     expect(controller.selectedTrack).toBeNull();
-
-    await controller.handleTimeUpdate();
-    expect(openSession).toHaveBeenCalledTimes(1);
-    expect(session.read).toHaveBeenCalledTimes(1);
   });
 
-  it("disables when accumulated progress exhausts the pump budget", async () => {
+  it("resets cumulative session scanning when the source changes", async () => {
+    const firstTrack = track(SOURCE_A.sourceKey);
+    const secondTrack = track(SOURCE_B.sourceKey);
+    const first = fakeSession(firstTrack, [limitResult({ bytesScanned: 100, packetsScanned: 4 })]);
+    const second = fakeSession(secondTrack, [
+      limitResult({ bytesScanned: 100, packetsScanned: 4 }),
+      packetResult(packet(secondTrack, { ptsSeconds: 2, text: "Fresh" })),
+      endResult()
+    ]);
+    const sessions = [first, second];
+    const failures: EmbeddedSubtitleFailure[] = [];
+    const output = renderer();
+    let now = 0;
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession: vi.fn(async () => sessions.shift()!),
+      renderer: output,
+      getCurrentTime: () => now,
+      maxBytesScannedPerPump: 100,
+      maxPacketsScannedPerPump: 4,
+      maxBytesScannedPerSession: 150,
+      onFailure: (failure) => failures.push(failure)
+    });
+
+    await controller.discover();
+    await expect(controller.selectTrack(firstTrack.id)).resolves.toBe(true);
+
+    await expect(controller.updateSource(SOURCE_B)).resolves.toEqual([secondTrack]);
+    await expect(controller.selectTrack(secondTrack.id)).resolves.toBe(true);
+    expect(failures).toEqual([]);
+
+    now = 1;
+    await controller.handleTimeUpdate();
+
+    expect(failures).toEqual([]);
+    expect(controller.selectedTrack).toEqual(secondTrack);
+    expect(output.add).toHaveBeenCalledWith(expect.objectContaining({ text: "Fresh" }));
+  });
+
+  it("ends the pump without disabling when accumulated progress exhausts the pump budget", async () => {
     const subtitleTrack = track();
     const session = fakeSession(subtitleTrack, [
       packetResult(packet(subtitleTrack), { bytesScanned: 16, packetsScanned: 4 })
     ]);
     const failures: EmbeddedSubtitleFailure[] = [];
+    const output = renderer();
     const controller = createEmbeddedSubtitleController({
       source: SOURCE_A,
       openSession: vi.fn(async () => session),
-      renderer: renderer(),
+      renderer: output,
       getCurrentTime: () => 0,
       maxBytesScannedPerPump: 16,
       maxPacketsScannedPerPump: 4,
@@ -351,16 +495,12 @@ describe("embedded subtitle controller", () => {
     });
 
     await controller.discover();
-    await expect(controller.selectTrack(subtitleTrack.id)).resolves.toBe(false);
+    await expect(controller.selectTrack(subtitleTrack.id)).resolves.toBe(true);
 
     expect(session.read).toHaveBeenCalledTimes(1);
-    expect(failures).toEqual([
-      {
-        code: "read-limit",
-        message: "Embedded subtitles were disabled because this file requires too much scanning."
-      }
-    ]);
-    expect(session.destroy).toHaveBeenCalledTimes(1);
+    expect(failures).toEqual([]);
+    expect(session.destroy).not.toHaveBeenCalled();
+    expect(output.add).toHaveBeenCalledWith(expect.objectContaining({ text: "Hello" }));
   });
 
   it("does not continue pumping while paused and resumes on timeupdate", async () => {
