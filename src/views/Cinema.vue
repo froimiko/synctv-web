@@ -26,11 +26,25 @@ import { RoomMemberPermission } from "@/types/Room";
 import artplayerPluginAss from "@/plugins/artplayer-plugin-ass";
 import { newSyncPlugin } from "@/plugins/sync";
 import artplayerPluginMediaControl from "@/plugins/control";
-import { artplayPluginSource } from "@/plugins/source";
+import { artplayPluginSource, PLAYER_SOURCE_PLUGIN_NAME } from "@/plugins/source";
+import type { PlayerSourcePlugin, ResolvedPlayerSource } from "@/plugins/source";
 import { currentMovieApi } from "@/services/apis/movie";
 import { userStore } from "@/stores/user";
 import { roomInfoApi } from "@/services/apis/room";
 import { artplayerSubtitle } from "@/plugins/subtitle";
+import type { SubtitleCoordinator } from "@/plugins/subtitle";
+import {
+  artplayerEmbeddedSubtitle,
+  EMBEDDED_SUBTITLE_PLUGIN_NAME
+} from "@/plugins/embeddedSubtitle/artplayerBridge";
+import type { EmbeddedSubtitleBridge } from "@/plugins/embeddedSubtitle/artplayerBridge";
+import {
+  buildPlayerSourceDescriptors,
+  createRefreshGuard,
+  EMBEDDED_SUBTITLE_FAILURE_MESSAGE,
+  movieIdentity,
+  restoredTrackId
+} from "@/plugins/playerSources";
 import { sendDanmu, artplayerStreamDanmu } from "@/plugins/danmu";
 import { indexStore } from "@/stores";
 
@@ -128,7 +142,91 @@ const sendMsg = (msg: string) => {
   });
 };
 
+/**
+ * Identity of the option build that produced the live player. Plugin callbacks
+ * capture their own build token and compare against this, so a callback owned
+ * by a discarded or superseded build can never write into the current menu.
+ * The computed only records the newest build; the token is promoted in
+ * `getPlayerInstance`, which is the real instance lifecycle event.
+ */
+let latestOptionToken: object | null = null;
+let activeOptionToken: object | null = null;
+
+/**
+ * Plugin lookups always go through the live `player` instance: `playerOption`
+ * is a computed, so a rebuilt player replaces every plugin object and cached
+ * references would point at a destroyed instance.
+ */
+const sourcePlugin = (): PlayerSourcePlugin | null => {
+  try {
+    return (player?.plugins?.[PLAYER_SOURCE_PLUGIN_NAME] as PlayerSourcePlugin | undefined) ?? null;
+  } catch {
+    return null;
+  }
+};
+
+const embeddedBridge = (): EmbeddedSubtitleBridge | null => {
+  try {
+    return (
+      (player?.plugins?.[EMBEDDED_SUBTITLE_PLUGIN_NAME] as EmbeddedSubtitleBridge | undefined) ??
+      null
+    );
+  } catch {
+    return null;
+  }
+};
+
+const subtitleCoordinator = (): SubtitleCoordinator | null => {
+  try {
+    return (player?.plugins?.["artplayerSubtitle"] as SubtitleCoordinator | undefined) ?? null;
+  } catch {
+    return null;
+  }
+};
+
+/** Fixed text only: media URLs and tokens must never reach the UI or console. */
+const notifyEmbeddedSubtitleFailure = () => {
+  ElNotification({
+    title: EMBEDDED_SUBTITLE_FAILURE_MESSAGE,
+    type: "warning"
+  });
+};
+
+/**
+ * Invalidates the embedded subtitle state of the source being replaced. This is
+ * awaited by the source plugin before `art.url` is written, so it must never
+ * touch the network: `updateSource(null)` bumps the controller generation and
+ * clears tracks/renderer synchronously, and only its resource cleanup is async,
+ * so the promise is deliberately not awaited. A hanging Range request must
+ * never be able to block a source switch.
+ */
+const invalidateEmbeddedSourceBeforeSwitch = () => {
+  const bridge = embeddedBridge();
+  if (!bridge) return;
+  void bridge.updateSource(null).then(
+    () => undefined,
+    () => undefined
+  );
+};
+
+/**
+ * Points the bridge at the source that is now playing and starts discovery.
+ * Tracks reach the menu through `onTracksChanged`, which is generation guarded,
+ * so nothing is written into the coordinator from here.
+ */
+const applyEmbeddedSourceAfterSwitch = async (next: ResolvedPlayerSource) => {
+  const bridge = embeddedBridge();
+  if (!bridge || !next.embeddedSubtitle) return;
+  try {
+    await bridge.updateSource(next.embeddedSubtitle);
+  } catch {
+    // Fail-open: embedded subtitles stay off for this source.
+  }
+};
+
 const playerOption = computed<options>(() => {
+  const optionToken = {};
+  latestOptionToken = optionToken;
   if (!room.currentMovie.base!.url) {
     return {
       url: ""
@@ -155,34 +253,54 @@ const playerOption = computed<options>(() => {
       }),
       // WARN: room.currentStatus 变了会导致重载
       newSyncPlugin(sendElement, room.currentStatus, () => room.currentExpireId),
-      artplayerPluginMediaControl(),
+      artplayerPluginMediaControl()
     ]
   };
 
+  const descriptors = buildPlayerSourceDescriptors(room.currentMovie.base!);
+  const embeddedSource = descriptors[0]?.embeddedSubtitle ?? null;
+  const embeddedCapable = descriptors.some((item) => item.embeddedSubtitle !== null);
+
   if (room.currentMovie.base!.moreSources) {
-    const obj = room.currentMovie.base!.moreSources || [];
     option.plugins!.push(
-      artplayPluginSource([
-        {
-          url: option.url,
-          html: "默认",
-          type: option.type || ""
-        },
-        ...obj.map((item) => ({
-          url: item.url,
-          html: item.name,
-          type: item.type
-        }))
-      ])
+      artplayPluginSource(descriptors, {
+        // Runs before `art.url` is written so the bridge never reads packets
+        // from the source that is being replaced.
+        beforeSwitch: () => invalidateEmbeddedSourceBeforeSwitch(),
+        afterSwitch: (next) => applyEmbeddedSourceAfterSwitch(next)
+      })
     );
   }
 
-  if (room.currentMovie.base!.subtitles) {
+  // Registered whenever ANY source slot can host embedded subtitles. A null
+  // initial source performs zero discovery, so no Range probe is issued until a
+  // capable source actually starts playing.
+  if (embeddedCapable) {
+    option.plugins!.push(
+      artplayerEmbeddedSubtitle({
+        source: embeddedSource,
+        onTracksChanged: (tracks) => {
+          if (optionToken !== activeOptionToken) return;
+          subtitleCoordinator()?.updateEmbeddedTracks(tracks);
+        },
+        onFailure: () => {
+          if (optionToken !== activeOptionToken) return;
+          notifyEmbeddedSubtitleFailure();
+        }
+      })
+    );
+  }
+
+  const subtitles = room.currentMovie.base!.subtitles;
+
+  // The coordinator owns the whole subtitle menu, so it must also be present for
+  // a pure embedded-subtitle MKV that ships no external subtitles at all.
+  if (subtitles || embeddedCapable) {
     let defaultUrl;
     let useAssPlugin = false;
 
     // deep copy
-    const subtitle = Object.assign({}, room.currentMovie.base!.subtitles);
+    const subtitle = Object.assign({}, subtitles);
 
     for (let key in subtitle) {
       if (subtitle[key].type === "ass") {
@@ -192,7 +310,12 @@ const playerOption = computed<options>(() => {
       }
     }
 
-    option.plugins!.push(artplayerSubtitle(subtitle));
+    option.plugins!.push(
+      artplayerSubtitle(subtitle, {
+        getEmbeddedBridge: embeddedBridge,
+        embeddedEnabled: embeddedCapable
+      })
+    );
     // return;
     useAssPlugin &&
       option.plugins!.push(
@@ -211,12 +334,66 @@ const playerOption = computed<options>(() => {
 });
 
 const { state: currentMovie, execute: reqCurrentMovieApi } = currentMovieApi();
+
+/** Overlapping EXPIRED refreshes: only the newest response may be applied. */
+const refreshGuard = createRefreshGuard();
+
+/**
+ * Re-points the embedded bridge at the refreshed URL of the source that is
+ * currently playing and restores the previously selected track when it survived
+ * the refresh. Ineligible sources are disabled instead of probed.
+ */
+const reapplyEmbeddedSourceAfterRefresh = async (
+  source: ResolvedPlayerSource | null,
+  refreshToken: number,
+  identity: string
+) => {
+  const bridge = embeddedBridge();
+  if (!bridge) return;
+
+  const stillCurrent = () =>
+    refreshGuard.isCurrent(refreshToken, identity) && movieIdentity(room.currentMovie) === identity;
+
+  const previousTrackId = bridge.selectedTrack?.id ?? null;
+
+  if (!source?.embeddedSubtitle) {
+    try {
+      await bridge.disable();
+      if (!stillCurrent()) return;
+      await bridge.updateSource(null);
+    } catch {
+      // Fail-open.
+    }
+    if (!stillCurrent()) return;
+    subtitleCoordinator()?.updateEmbeddedTracks([]);
+    return;
+  }
+
+  try {
+    const tracks = await bridge.updateSource(source.embeddedSubtitle);
+    if (!stillCurrent()) return;
+    subtitleCoordinator()?.updateEmbeddedTracks(tracks);
+    const restored = restoredTrackId(previousTrackId, tracks);
+    if (restored) {
+      if (!stillCurrent()) return;
+      await bridge.selectTrack(restored);
+    }
+  } catch {
+    // Fail-open: embedded subtitles turn off, playback continues.
+  }
+};
+
 const updateSources = async () => {
+  const identity = movieIdentity(room.currentMovie);
+  const refreshToken = refreshGuard.begin(identity);
   try {
     await reqCurrentMovieApi({
       headers: { Authorization: token.value, "X-Room-Id": roomID.value }
     });
     if (!currentMovie.value) return;
+    // A newer refresh started, or the room moved to another movie while this
+    // request was in flight: the whole response is stale and must be dropped.
+    if (!refreshGuard.isCurrent(refreshToken, movieIdentity(room.currentMovie))) return;
     if (currentMovie.value.movie.base.url.startsWith("/")) {
       currentMovie.value.movie.base.url = `${window.location.origin}${currentMovie.value.movie.base.url}`;
     }
@@ -226,39 +403,65 @@ const updateSources = async () => {
     ) {
       for (let i = 0; i < currentMovie.value.movie.base.moreSources.length; i++) {
         if (currentMovie.value.movie.base.moreSources[i].url.startsWith("/")) {
-          currentMovie.value.movie.base.moreSources[i].url =
-            `${window.location.origin}${currentMovie.value.movie.base.moreSources[i].url}`;
+          currentMovie.value.movie.base.moreSources[
+            i
+          ].url = `${window.location.origin}${currentMovie.value.movie.base.moreSources[i].url}`;
         }
       }
     }
-    if (!player) return;
+    // Updated before any player work so the expire id stays fresh even when no
+    // player is mounted.
     room.currentExpireId = currentMovie.value.expireId;
-    const moreSources = currentMovie.value.movie.base.moreSources || [];
-    player.plugins["source"].updateSources([
-      {
-        url: currentMovie.value.movie.base.url,
-        html: "默认",
-        type: currentMovie.value.movie.base.type || ""
-      },
-      ...moreSources.map((item) => ({
-        url: item.url,
-        html: item.name,
-        type: item.type
-      }))
-    ]);
+    if (!player) return;
+
+    const base = currentMovie.value.movie.base;
+    const descriptors = buildPlayerSourceDescriptors(base);
+    const sources = sourcePlugin();
+
+    if (sources) {
+      // Restores by key, not by label: the source plugin re-runs beforeSwitch /
+      // afterSwitch, which re-points the bridge at the refreshed URL.
+      sources.updateSources(descriptors);
+    } else {
+      // Single-source movies have no source plugin, so the bridge has to be
+      // re-pointed here.
+      await reapplyEmbeddedSourceAfterRefresh(descriptors[0] ?? null, refreshToken, identity);
+    }
+
+    if (!refreshGuard.isCurrent(refreshToken, movieIdentity(room.currentMovie))) return;
+    // EXPIRED also rotates external subtitle URLs.
+    subtitleCoordinator()?.updateSubtitles(base.subtitles ?? {});
   } catch (err: any) {
-    console.log(err);
     ElNotification({
       title: "获取影片列表失败",
-      message: err.response.data.error || err.message,
+      message: err?.response?.data?.error ?? err?.message ?? "未知错误",
       type: "error"
     });
   }
 };
 
 const getPlayerInstance = (art: Artplayer) => {
+  activeOptionToken = latestOptionToken;
   player = art;
   listenPlayerType(player);
+  startEmbeddedSubtitleDiscovery(art);
+};
+
+/**
+ * Discovery is kicked off after `ready` so the media element and the subtitle
+ * plumbing exist. Tracks reach the menu through `onTracksChanged`, so the
+ * returned value is only used to keep the promise handled.
+ */
+const startEmbeddedSubtitleDiscovery = (art: Artplayer) => {
+  art.once("ready", () => {
+    const bridge =
+      (art.plugins?.[EMBEDDED_SUBTITLE_PLUGIN_NAME] as EmbeddedSubtitleBridge | undefined) ?? null;
+    if (!bridge) return;
+    void bridge.discover().then(
+      () => undefined,
+      () => undefined
+    );
+  });
 };
 
 const playType = ref<string | undefined>();
@@ -587,7 +790,7 @@ const handleElementMessage = (msg: Message) => {
         title: "链接过期,刷新中",
         type: "info"
       });
-      updateSources();
+      void updateSources().catch(() => undefined);
       break;
     }
 
@@ -730,6 +933,17 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   navigator.mediaDevices.removeEventListener("devicechange", getAudioDevices);
+  // Player.vue destroys the instance on unmount too, which tears the bridge
+  // down via Artplayer's `destroy` event. This is the belt-and-braces path for
+  // when Cinema unmounts before the child component does.
+  const bridge = embeddedBridge();
+  player = undefined;
+  if (bridge) {
+    void bridge.destroy().then(
+      () => undefined,
+      () => undefined
+    );
+  }
 });
 </script>
 

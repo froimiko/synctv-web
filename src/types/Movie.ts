@@ -25,10 +25,14 @@ export interface MoreSource {
   name: string;
   url: string;
   type: string;
+  sourceKey?: string;
+  isTranscode?: boolean;
 }
 
 export interface BaseMovieInfo {
   url: string;
+  sourceKey?: string;
+  isTranscode?: boolean;
   moreSources?: MoreSource[];
   name: string;
   live: boolean;

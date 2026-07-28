@@ -29,7 +29,12 @@ Artplayer.PLAYBACK_RATE = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 3, 4, 5].reverse();
 Artplayer.FAST_FORWARD_VALUE = 3; // 设置长按倍速的速率
 Artplayer.FAST_FORWARD_TIME = 1000; // 设置长按加速的延迟时间（毫秒）
 
-let art: Artplayer;
+let art: Artplayer | undefined;
+/**
+ * Bumped on every mount/destroy. Async work started for one instance compares
+ * against it so a late continuation can never touch a newer player.
+ */
+let currentInstanceToken = 0;
 const p2pEngine: Ref<p2pOperationType | undefined> = ref(undefined);
 const p2pStats = ref<p2pStatsType>();
 
@@ -94,6 +99,11 @@ const Emits = defineEmits(["get-instance"]);
 const playMedia = async (player: HTMLMediaElement, url: string, art: any) => {
   resetP2P();
 
+  // Captured before any await: a destroyed/remounted instance must never have
+  // its media element reassigned by a late proxy resolution.
+  const instanceToken = currentInstanceToken;
+  const isStale = () => instanceToken !== currentInstanceToken || Boolean(art?.isDestroy);
+
   const p2pConfig: P2pConfigMedia = {
     swFile: "/web/sw.media.js",
     p2pEnabled: defaultP2PEnabled.value,
@@ -103,11 +113,11 @@ const playMedia = async (player: HTMLMediaElement, url: string, art: any) => {
   engine
     .getProxiedUrl(url)
     .then((proxiedUrl) => {
-      console.log(proxiedUrl);
+      if (isStale()) return;
       player.src = proxiedUrl;
     })
-    .catch((err) => {
-      console.error(err);
+    .catch(() => {
+      if (isStale()) return;
       player.src = url;
     });
   engine.on("stats", (stats) => {
@@ -398,7 +408,7 @@ const newPlayerOption = (html: HTMLDivElement): Option => {
     plugins: Props.options.plugins,
     subtitle: {
       encoding: "utf-8",
-      escape: false
+      escape: true
     },
     moreVideoAttr: {
       controls: false,
@@ -425,25 +435,51 @@ const newPlayerOption = (html: HTMLDivElement): Option => {
 
 const father = ref<HTMLDivElement>();
 
-const mountPlayer = () => {
-  if (art) {
-    console.log("player destroy");
-    art.destroy();
+/** Idempotent teardown shared by the remount and unmount paths. */
+const destroyPlayer = () => {
+  const instance = art;
+  if (!instance) return;
+  art = undefined;
+  currentInstanceToken += 1;
+  try {
+    if (!instance.isDestroy) instance.destroy();
+  } catch (err) {
+    console.error(err);
   }
+};
+
+const mountPlayer = () => {
+  destroyPlayer();
   const newDiv = document.createElement("div");
   newDiv.setAttribute("class", "artplayer-app");
   while (father.value!.firstChild) {
     father.value!.removeChild(father.value!.firstChild);
   }
   father.value!.appendChild(newDiv);
-  art = new Artplayer(newPlayerOption(newDiv));
-  art.on("destroy", () => {
-    destroyOldCustomPlayLib(art);
+  const instance = new Artplayer(newPlayerOption(newDiv));
+  art = instance;
+  currentInstanceToken += 1;
+  // The captured instance is used instead of the mutable `art`: Artplayer's
+  // own `destroy` fallback may fire after a newer player already replaced it.
+  instance.on("destroy", () => {
+    destroyOldCustomPlayLib(instance);
+    // resetP2P() is idempotent and the destroyed instance always owned the
+    // current engine (a replacement engine is only created after this fires),
+    // so it must run unconditionally: an instance-token guard here would skip
+    // teardown on the destroyPlayer() path and leak the engine.
     resetP2P();
-    art.video.src = "";
+    if (art === instance) {
+      art = undefined;
+      currentInstanceToken += 1;
+    }
+    try {
+      instance.video.src = "";
+    } catch (err) {
+      console.error(err);
+    }
   });
   // addHotKeyEvnet(art);
-  Emits("get-instance", art);
+  Emits("get-instance", instance);
 };
 
 const cleanHotKeyEvent = (art: Artplayer, keys: number[]) => {
@@ -564,7 +600,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  art.destroy();
+  destroyPlayer();
 });
 </script>
 
