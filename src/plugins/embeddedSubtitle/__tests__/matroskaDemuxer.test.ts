@@ -533,6 +533,20 @@ describe("Matroska embedded subtitle track extraction", () => {
     ).toBeNull();
   });
 
+  it("keeps subrip streams whose TrackEntry was not populated", () => {
+    // Regression: fastOpen does not guarantee a parsed TrackEntry on privData,
+    // and codecpar.codecId is authoritative (IMatroskaFormat maps only
+    // S_TEXT/UTF8 onto AV_CODEC_ID_SUBRIP). A missing or partial entry must not
+    // silently drop a real subrip track, which produced an empty subtitle menu
+    // on a real Emby MKV whose tracks MediaInfo confirmed as subrip.
+    const cases: unknown[] = [undefined, null, {}, { number: 3, uid: 42n }];
+    for (const privData of cases) {
+      const track = extractEmbeddedSubtitleTrack(stream({ privData }), "source-a");
+      expect(track).not.toBeNull();
+      expect(track?.codecId).toBe("S_TEXT/UTF8");
+    }
+  });
+
   it("uses stream metadata and disposition when TrackEntry fields are absent", () => {
     const result = extractEmbeddedSubtitleTrack(
       stream({

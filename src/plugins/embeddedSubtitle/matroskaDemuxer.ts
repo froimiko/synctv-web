@@ -267,9 +267,15 @@ export function extractEmbeddedSubtitleTrack(
   if (stream.codecpar.codecType !== LIBMEDIA_MEDIA_TYPE_SUBTITLE) return null;
   if (stream.codecpar.codecId !== LIBMEDIA_CODEC_ID_SUBRIP) return null;
 
-  // IMatroskaFormat stores its parsed TrackEntry on AVStream.privData.
+  // `codecpar.codecId` is authoritative: IMatroskaFormat's own table maps only
+  // "S_TEXT/UTF8" onto AV_CODEC_ID_SUBRIP, so the check above already excludes
+  // every other subtitle CodecID. `privData` carries the parsed TrackEntry but is
+  // not guaranteed to be populated under `fastOpen`, so treating a missing or
+  // partial entry as a rejection silently drops real subrip tracks. It may only
+  // veto when it is present AND explicitly disagrees.
   const track = (stream.privData || {}) as MatroskaTrackPrivateData;
-  if (track.codecId !== "S_TEXT/UTF8") return null;
+  const declaredCodecId = optionalString(track.codecId);
+  if (declaredCodecId !== undefined && declaredCodecId !== "S_TEXT/UTF8") return null;
 
   const streamIndex = stream.index;
   const trackNumber = optionalNumber(track.number);
