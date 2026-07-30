@@ -152,7 +152,13 @@ function sourcesEqual(
   first: EmbeddedSubtitleSource | null,
   second: EmbeddedSubtitleSource | null
 ): boolean {
-  return first?.url === second?.url && first?.sourceKey === second?.sourceKey;
+  if (first === null || second === null) return first === second;
+  const firstSourceKey = first.sourceKey.trim();
+  const secondSourceKey = second.sourceKey.trim();
+  // A refreshable token-bearing URL is not source identity and must never
+  // trigger teardown when both sides identify the same stable sourceKey.
+  if (firstSourceKey && secondSourceKey) return firstSourceKey === secondSourceKey;
+  return first.url === second.url && first.sourceKey === second.sourceKey;
 }
 
 function seekMilliseconds(seconds: number): number {
@@ -194,7 +200,7 @@ export function createEmbeddedSubtitleController(
     )
   );
 
-  let source = options.source ?? null;
+  let source = options.source ? { ...options.source } : null;
   let tracks: EmbeddedSubtitleTrack[] = [];
   let selectedTrack: EmbeddedSubtitleTrack | null = null;
   let sessionRecord: SessionRecord | null = null;
@@ -388,10 +394,14 @@ export function createEmbeddedSubtitleController(
 
   const invalidateWork = (
     destroySession: boolean,
-    timestampSeconds = currentTime()
+    timestampSeconds = currentTime(),
+    // Seeking must not abort an in-flight discovery: cancelling it can strand
+    // the controller with zero tracks and nothing ever retries. Callers that
+    // genuinely replace the source still cancel it.
+    cancelOpen = true
   ): { token: number; cleanup: Promise<void> } => {
     generation += 1;
-    const pendingPromise = cancelPendingOpen();
+    const pendingPromise = cancelOpen ? cancelPendingOpen() : null;
     const sessionCleanup = destroySession ? detachSession() : Promise.resolve();
     resetCueState(timestampSeconds);
     sessionBytesScanned = 0;
@@ -752,7 +762,12 @@ export function createEmbeddedSubtitleController(
       // synchronous block below is the sole contract that guarantees generation
       // bump, abort, and renderer clear happen before the first `await`.
       if (nextSource) {
-        if (sourcesEqual(source, nextSource)) return controller.discover();
+        if (sourcesEqual(source, nextSource)) {
+          // Keep the controller's canonical source fresh without invalidating the
+          // live or opening session. Any later open must use the newest token URL.
+          if (source && source.url !== nextSource.url) source.url = nextSource.url;
+          return controller.discover();
+        }
       } else if (source === null && !sessionRecord) {
         return [];
       }
@@ -834,7 +849,16 @@ export function createEmbeddedSubtitleController(
       const trackId = selectedTrack?.id ?? null;
       const normalizedTimestamp =
         Number.isFinite(timestampSeconds) && timestampSeconds >= 0 ? timestampSeconds : 0;
-      const invalidation = invalidateWork(true, normalizedTimestamp);
+      // Subtitle tracks are file-level metadata and are independent of the
+      // playback position, so a seek only rewinds cue state. Destroying the
+      // demux session here forced a full re-discovery on every seek and made
+      // subtitles disappear after a few seconds.
+      const preserveSession = sessionRecord !== null;
+      const invalidation = invalidateWork(
+        !preserveSession,
+        normalizedTimestamp,
+        !preserveSession
+      );
       const token = invalidation.token;
       await invalidation.cleanup;
       if (!trackId || !isCurrent(token)) return false;

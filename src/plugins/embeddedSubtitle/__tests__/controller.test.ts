@@ -19,6 +19,10 @@ const SOURCE_B = {
   url: "https://secret.example/private-b.mkv?token=hidden",
   sourceKey: "source-b"
 };
+const SOURCE_A_REFRESHED = {
+  url: "https://secret.example/private-a.mkv?token=refreshed",
+  sourceKey: SOURCE_A.sourceKey
+};
 
 function track(sourceKey = SOURCE_A.sourceKey): EmbeddedSubtitleTrack {
   return {
@@ -535,63 +539,84 @@ describe("embedded subtitle controller", () => {
     expect(session.read).toHaveBeenCalledTimes(2);
   });
 
-  it("reopens and seeks safely for forward and backward seeks", async () => {
+  it("reuses the open session across forward and backward seeks", async () => {
     const subtitleTrack = track();
-    const first = fakeSession(subtitleTrack);
-    const forward = fakeSession(subtitleTrack);
-    const backward = fakeSession(subtitleTrack);
-    const sessions = [first, forward, backward];
+    const only = fakeSession(subtitleTrack);
+    const openSession = vi.fn(async () => only);
     const controller = createEmbeddedSubtitleController({
       source: SOURCE_A,
-      openSession: vi.fn(async () => sessions.shift()!),
+      openSession,
       renderer: renderer(),
       getCurrentTime: () => 0
     });
 
     await controller.discover();
     await controller.selectTrack(subtitleTrack.id);
+    const readsAfterSelect = only.read.mock.calls.length;
+
     await expect(controller.handleSeek(40)).resolves.toBe(true);
     await expect(controller.handleSeek(5)).resolves.toBe(true);
 
-    expect(first.destroy).toHaveBeenCalledTimes(1);
-    expect(forward.destroy).toHaveBeenCalledTimes(1);
-    expect(forward.seek).toHaveBeenCalledWith(subtitleTrack.id, 40000, expect.any(Object));
-    expect(forward.read).toHaveBeenCalledTimes(1);
-    expect(backward.seek).toHaveBeenCalledWith(subtitleTrack.id, 5000, expect.any(Object));
-    expect(backward.read).toHaveBeenCalledTimes(1);
+    // Subtitle tracks are file-level metadata: a seek must never destroy the
+    // demux session, because re-discovering on every seek made subtitles
+    // vanish after a few seconds on a real Emby MKV.
+    expect(only.destroy).not.toHaveBeenCalled();
+    expect(openSession).toHaveBeenCalledTimes(1);
+    expect(controller.tracks).toHaveLength(1);
+    expect(controller.selectedTrack?.id).toBe(subtitleTrack.id);
+
+    // Both seeks still reposition the demuxer and keep pumping.
+    expect(only.seek).toHaveBeenCalledWith(subtitleTrack.id, 40000, expect.any(Object));
+    expect(only.seek).toHaveBeenCalledWith(subtitleTrack.id, 5000, expect.any(Object));
+    expect(only.read.mock.calls.length).toBeGreaterThan(readsAfterSelect);
   });
 
   it("rapid seeks prevent an older deferred read from adding cues", async () => {
     const subtitleTrack = track();
-    const initial = fakeSession(subtitleTrack);
-    const stale = fakeSession(subtitleTrack);
-    const latest = fakeSession(subtitleTrack);
+    const only = fakeSession(subtitleTrack);
     const staleRead = deferred<MatroskaDemuxReadResult>();
-    stale.read.mockImplementationOnce(() => staleRead.promise);
-    const sessions = [initial, stale, latest];
     const output = renderer();
     let now = 0;
     const controller = createEmbeddedSubtitleController({
       source: SOURCE_A,
-      openSession: vi.fn(async () => sessions.shift()!),
+      openSession: vi.fn(async () => only),
       renderer: output,
       getCurrentTime: () => now
     });
 
     await controller.discover();
     await controller.selectTrack(subtitleTrack.id);
-    now = 30;
-    const firstSeek = controller.handleSeek(30);
-    await waitFor(() => stale.read.mock.calls.length === 1);
-    now = 2;
-    const secondSeek = controller.handleSeek(2);
-    await secondSeek;
-    staleRead.resolve(packetResult(packet(subtitleTrack, { ptsSeconds: 30, text: "Stale" })));
-    await firstSeek;
+    output.add.mockClear();
 
-    expect(output.add).not.toHaveBeenCalledWith(expect.objectContaining({ text: "Stale" }));
-    expect(stale.destroy).toHaveBeenCalledTimes(1);
-    expect(latest.seek).toHaveBeenCalledWith(subtitleTrack.id, 2000, expect.any(Object));
+    let staleReadIssued = false;
+    only.read.mockImplementationOnce(() => {
+      staleReadIssued = true;
+      return staleRead.promise;
+    });
+
+    now = 40;
+    const stalePump = controller.handleSeek(40);
+    // Let the first seek actually reach session.read before superseding it.
+    for (let step = 0; step < 40 && !staleReadIssued; step += 1) {
+      await Promise.resolve();
+    }
+    expect(staleReadIssued).toBe(true);
+
+    now = 5;
+    const freshPump = controller.handleSeek(5);
+
+    staleRead.resolve({
+      status: "packet",
+      bytesScanned: 1,
+      packetsScanned: 1,
+      packet: packet(subtitleTrack, { ptsSeconds: 41, text: "stale" })
+    });
+
+    await stalePump;
+    await freshPump;
+
+    const addedTexts = output.add.mock.calls.map((call) => call[0].text);
+    expect(addedTexts).not.toContain("stale");
   });
 
   it("a stale rejected open cannot disable a newer source", async () => {
@@ -621,6 +646,121 @@ describe("embedded subtitle controller", () => {
     expect(failures).toEqual([]);
     expect(controller.tracks).toEqual([secondTrack]);
     expect(JSON.stringify(failures)).not.toContain(SOURCE_A.url);
+  });
+
+  it("keeps tracks and in-flight work alive across a token-only URL refresh", async () => {
+    const subtitleTrack = track();
+    const session = fakeSession(subtitleTrack);
+    const pendingRead = deferred<MatroskaDemuxReadResult>();
+    session.read.mockImplementationOnce(() => pendingRead.promise);
+    const tracksChanged = vi.fn();
+    const openSession = vi.fn(async () => session);
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession,
+      renderer: renderer(),
+      getCurrentTime: () => 0,
+      onTracksChanged: tracksChanged
+    });
+
+    await controller.discover();
+    const selecting = controller.selectTrack(subtitleTrack.id);
+    await waitFor(() => session.read.mock.calls.length === 1);
+    tracksChanged.mockClear();
+
+    await expect(controller.updateSource(SOURCE_A_REFRESHED)).resolves.toEqual([subtitleTrack]);
+    expect(openSession).toHaveBeenCalledTimes(1);
+    expect((openSession.mock.calls[0]?.[0].signal as AbortSignal).aborted).toBe(false);
+    expect(session.destroy).not.toHaveBeenCalled();
+    expect(controller.tracks).toEqual([subtitleTrack]);
+    expect(controller.selectedTrack).toEqual(subtitleTrack);
+    expect(tracksChanged).not.toHaveBeenCalledWith([]);
+
+    pendingRead.resolve(endResult());
+    await selecting;
+    expect(controller.selectedTrack).toEqual(subtitleTrack);
+  });
+
+  it("keeps one session and a stable selection across repeated token refreshes", async () => {
+    const subtitleTrack = track();
+    const session = fakeSession(subtitleTrack);
+    const openSession = vi.fn(async () => session);
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession,
+      renderer: renderer(),
+      getCurrentTime: () => 0
+    });
+
+    await controller.discover();
+    await controller.selectTrack(subtitleTrack.id);
+    for (let index = 1; index <= 5; index += 1) {
+      await expect(
+        controller.updateSource({
+          url: `https://secret.example/private-a.mkv?token=refresh-${index}`,
+          sourceKey: SOURCE_A.sourceKey
+        })
+      ).resolves.toEqual([subtitleTrack]);
+    }
+
+    expect(openSession).toHaveBeenCalledTimes(1);
+    expect(session.destroy).not.toHaveBeenCalled();
+    expect(controller.tracks).toEqual([subtitleTrack]);
+    expect(controller.selectedTrack).toEqual(subtitleTrack);
+  });
+
+  it("a different sourceKey still tears down and opens a new session", async () => {
+    const first = fakeSession(track(SOURCE_A.sourceKey));
+    const secondTrack = track(SOURCE_B.sourceKey);
+    const second = fakeSession(secondTrack);
+    const sessions = [first, second];
+    const openSession = vi.fn(async () => sessions.shift()!);
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession,
+      renderer: renderer(),
+      getCurrentTime: () => 0
+    });
+
+    await controller.discover();
+    await expect(controller.updateSource(SOURCE_B)).resolves.toEqual([secondTrack]);
+
+    expect(first.destroy).toHaveBeenCalledTimes(1);
+    expect(openSession).toHaveBeenCalledTimes(2);
+    expect(openSession).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: SOURCE_B.url, sourceKey: SOURCE_B.sourceKey })
+    );
+  });
+
+  it("uses the latest token URL after a later real source change", async () => {
+    const first = fakeSession(track(SOURCE_A.sourceKey));
+    const secondTrack = track(SOURCE_B.sourceKey);
+    const second = fakeSession(secondTrack);
+    const reopened = fakeSession(track(SOURCE_A.sourceKey));
+    const sessions = [first, second, reopened];
+    const openSession = vi.fn(async () => sessions.shift()!);
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession,
+      renderer: renderer(),
+      getCurrentTime: () => 0
+    });
+
+    await controller.discover();
+    await controller.updateSource(SOURCE_A_REFRESHED);
+    await controller.updateSource(SOURCE_B);
+    await controller.updateSource(SOURCE_A_REFRESHED);
+
+    expect(openSession).toHaveBeenCalledTimes(3);
+    expect(openSession.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({ url: SOURCE_A.url, sourceKey: SOURCE_A.sourceKey })
+    );
+    expect(openSession.mock.calls[1]?.[0]).toEqual(
+      expect.objectContaining({ url: SOURCE_B.url, sourceKey: SOURCE_B.sourceKey })
+    );
+    expect(openSession.mock.calls[2]?.[0]).toEqual(
+      expect.objectContaining({ url: SOURCE_A_REFRESHED.url, sourceKey: SOURCE_A.sourceKey })
+    );
   });
 
   it("source updates release the previous session and discover the new source", async () => {

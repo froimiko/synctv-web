@@ -261,7 +261,7 @@ const playerOption = computed<options>(() => {
   const embeddedSource = descriptors[0]?.embeddedSubtitle ?? null;
   const embeddedCapable = descriptors.some((item) => item.embeddedSubtitle !== null);
 
-  if (room.currentMovie.base!.moreSources) {
+  if (descriptors.length > 1) {
     option.plugins!.push(
       artplayPluginSource(descriptors, {
         // Runs before `art.url` is written so the bridge never reads packets

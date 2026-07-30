@@ -86,6 +86,18 @@ describe("playerSourceKey", () => {
 });
 
 describe("buildPlayerSourceDescriptors", () => {
+  it("builds exactly one descriptor for a single-source movie", () => {
+    const descriptors = buildPlayerSourceDescriptors(base({ moreSources: [] }));
+
+    expect(descriptors).toHaveLength(1);
+    expect(descriptors[0]).toEqual(
+      expect.objectContaining({
+        key: "source-key:media-source-1",
+        url: "https://emby.test/videos/1/stream"
+      })
+    );
+  });
+
   it("puts the primary source first and preserves moreSources order", () => {
     const descriptors = buildPlayerSourceDescriptors(
       base({

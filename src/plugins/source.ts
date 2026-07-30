@@ -278,6 +278,13 @@ export function artplayPluginSource(
         current = null;
         return;
       }
+      if (previousKey && target.key === previousKey) {
+        // EXPIRED refreshes rotate the media URL every few seconds. Re-running a
+        // full switch for the source already playing would reload the video and
+        // tear down embedded subtitles; only a different key is a real switch.
+        current = target;
+        return;
+      }
       ignore(switchTo(target));
     };
 

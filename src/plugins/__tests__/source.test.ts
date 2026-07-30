@@ -277,6 +277,38 @@ describe("artplayPluginSource", () => {
     expect(afterSwitch).toHaveBeenCalledTimes(1);
   });
 
+  it("refreshes the current descriptor without switching or writing art.url", async () => {
+    const fake = createFakeArt();
+    const beforeSwitch = vi.fn();
+    const plugin = artplayPluginSource(twoSources(), { beforeSwitch })(fake.art);
+    const writesBeforeRefresh = fake.urlWrites.length;
+
+    plugin.updateSources([
+      source({ key: "source-key:a", url: "https://example.test/a.mkv?token=fresh" }),
+      source({ key: "source-key:b", html: "源B", url: "https://example.test/b.mkv" })
+    ]);
+    await flush();
+
+    expect(fake.urlWrites).toHaveLength(writesBeforeRefresh);
+    expect(beforeSwitch).not.toHaveBeenCalled();
+    expect(plugin.currentSource()?.url).toBe("https://example.test/a.mkv?token=fresh");
+  });
+
+  it("updateSources still performs a real switch when the current key disappeared", async () => {
+    const fake = createFakeArt();
+    const beforeSwitch = vi.fn();
+    const plugin = artplayPluginSource(twoSources(), { beforeSwitch })(fake.art);
+
+    plugin.updateSources([
+      source({ key: "source-key:c", html: "源C", url: "https://example.test/c.mkv" })
+    ]);
+    await flush();
+
+    expect(beforeSwitch).toHaveBeenCalledTimes(1);
+    expect(fake.urlWrites).toEqual(["https://example.test/c.mkv"]);
+    expect(plugin.currentKey()).toBe("source-key:c");
+  });
+
   it("restores the current source by key across updateSources, not by label", async () => {
     const fake = createFakeArt();
     const plugin = artplayPluginSource(twoSources())(fake.art);
@@ -292,7 +324,8 @@ describe("artplayPluginSource", () => {
     await flush();
 
     expect(plugin.currentKey()).toBe("source-key:b");
-    expect(fake.urlWrites[fake.urlWrites.length - 1]).toBe("https://example.test/b2.mkv");
+    expect(plugin.currentSource()?.url).toBe("https://example.test/b2.mkv");
+    expect(fake.urlWrites[fake.urlWrites.length - 1]).toBe("https://example.test/b.mkv");
   });
 
   it("restores the correct slot when two sources share a display name", async () => {
