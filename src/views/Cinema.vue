@@ -453,7 +453,7 @@ const getPlayerInstance = (art: Artplayer) => {
  * returned value is only used to keep the promise handled.
  */
 const startEmbeddedSubtitleDiscovery = (art: Artplayer) => {
-  art.once("ready", () => {
+  const startDiscovery = () => {
     const bridge =
       (art.plugins?.[EMBEDDED_SUBTITLE_PLUGIN_NAME] as EmbeddedSubtitleBridge | undefined) ?? null;
     if (!bridge) return;
@@ -461,7 +461,17 @@ const startEmbeddedSubtitleDiscovery = (art: Artplayer) => {
       () => undefined,
       () => undefined
     );
-  });
+  };
+
+  // `ready` is a one-shot event and `get-instance` can be emitted after it has
+  // already fired, in which case `once('ready')` would never run and discovery
+  // would silently never start. Artplayer sets `isReady` before emitting, so it
+  // is the authoritative check for the already-ready case.
+  if (art.isReady) {
+    startDiscovery();
+    return;
+  }
+  art.once("ready", startDiscovery);
 };
 
 const playType = ref<string | undefined>();

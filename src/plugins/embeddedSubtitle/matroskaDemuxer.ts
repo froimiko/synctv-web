@@ -635,33 +635,6 @@ export async function openMatroskaDemuxWithRuntime(
     }
 
     const tracks = extractEmbeddedSubtitleTracks(context.streams, options.sourceKey);
-    // SYNCTV_EMBEDDED_DIAG: temporary, remove after root cause is confirmed.
-    try {
-      const rawStreams = (context.streams || []) as unknown[];
-      /* eslint-disable no-console */
-      console.log("[synctv-diag] openResult=", openResult,
-        "analyzeCount=", inputFormat.getAnalyzeStreamsCount(),
-        "streamCount=", rawStreams.length);
-      rawStreams.forEach((raw, i) => {
-        const st = raw as Record<string, any>;
-        const pd = (st && st.privData) || null;
-        console.log("[synctv-diag] stream#" + i, JSON.stringify({
-          index: st?.index,
-          codecType: st?.codecpar?.codecType,
-          codecId: st?.codecpar?.codecId,
-          hasPrivData: Boolean(pd),
-          privKeys: pd ? Object.keys(pd).slice(0, 12) : [],
-          privCodecId: pd ? pd.codecId : undefined,
-          metaKeys: st?.metadata ? Object.keys(st.metadata).slice(0, 8) : [],
-          timeBase: st?.timeBase ? { n: st.timeBase.num, d: st.timeBase.den } : null
-        }));
-      });
-      console.log("[synctv-diag] extractedTracks=", tracks.length);
-      /* eslint-enable no-console */
-    } catch (diagError) {
-      /* eslint-disable-next-line no-console */
-      console.log("[synctv-diag] failed:", (diagError as Error)?.message);
-    }
     const tracksById = new Map(tracks.map((track) => [track.id, track]));
     const sessionContext = context;
     const sessionReader = reader;
