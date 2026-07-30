@@ -130,6 +130,8 @@ const DEFAULT_MAX_PACKETS_PER_PUMP = 128;
 const DEFAULT_MAX_BYTES_SCANNED_PER_PUMP = 24 * 1024 * 1024;
 const DEFAULT_MAX_PACKETS_SCANNED_PER_PUMP = 16384;
 const DEFAULT_MAX_BYTES_SCANNED_PER_SESSION = 512 * 1024 * 1024;
+const DISCOVERY_RETRY_DELAY_MS = 2000;
+const MAX_DISCOVERY_ATTEMPTS = 5;
 
 function positiveFinite(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
@@ -209,6 +211,8 @@ export function createEmbeddedSubtitleController(
   let destroyPromise: Promise<void> | null = null;
   let generation = 0;
   let destroyed = false;
+  let discoveryRetryAt = 0;
+  let discoveryAttempts = 0;
   let cueStage: EmbeddedSubtitleCueStage = createSubtitleCueStage();
   let decodedCues = new Map<string, EmbeddedSubtitleCue>();
   let rendererResidentCueKeys = new Set<string>();
@@ -401,6 +405,10 @@ export function createEmbeddedSubtitleController(
     cancelOpen = true
   ): { token: number; cleanup: Promise<void> } => {
     generation += 1;
+    // A seek adopts an opening session into the new cue generation. Other
+    // invalidations (notably disable) leave its old token intact so a settled
+    // result is recognized as stale and destroyed instead of being installed.
+    if (!destroySession && !cancelOpen && pendingOpen) pendingOpen.token = generation;
     const pendingPromise = cancelOpen ? cancelPendingOpen() : null;
     const sessionCleanup = destroySession ? detachSession() : Promise.resolve();
     resetCueState(timestampSeconds);
@@ -421,6 +429,7 @@ export function createEmbeddedSubtitleController(
       tracks.length !== normalized.length ||
       tracks.some((track, index) => track.id !== normalized[index]?.id);
     tracks = normalized;
+    if (tracks.length > 0) discoveryAttempts = 0;
     if (selectedTrack) {
       selectedTrack = tracks.find((track) => track.id === selectedTrack?.id) ?? null;
     }
@@ -463,7 +472,10 @@ export function createEmbeddedSubtitleController(
     replaceTracks(nextTracks);
   };
 
-  const ensureSession = async (token: number): Promise<SessionRecord | null> => {
+  const ensureSession = async (
+    token: number,
+    reportOpenFailure = true
+  ): Promise<SessionRecord | null> => {
     if (!isCurrent(token) || !source) return null;
     if (sessionRecord && sourcesEqual(sessionRecord.source, source)) return sessionRecord;
     if (pendingOpen && pendingOpen.token === token && sourcesEqual(pendingOpen.source, source)) {
@@ -484,7 +496,7 @@ export function createEmbeddedSubtitleController(
           signal: abortController.signal
         });
         if (
-          !isCurrent(token) ||
+          !isCurrent(opening.token) ||
           abortController.signal.aborted ||
           !sourcesEqual(source, openingSource)
         ) {
@@ -498,11 +510,16 @@ export function createEmbeddedSubtitleController(
       } catch (error) {
         // Failure cleanup must not await the promise currently executing this catch.
         if (pendingOpen === opening) pendingOpen = null;
-        if (!isCurrent(token) || abortController.signal.aborted || isAbortError(error)) {
-          if (isCurrent(token)) await disableAfterAbort(token);
+        if (
+          !isCurrent(opening.token) ||
+          abortController.signal.aborted ||
+          isAbortError(error)
+        ) {
+          if (isCurrent(opening.token)) await disableAfterAbort(opening.token);
           return null;
         }
-        await disableForFailure("open", token);
+        if (reportOpenFailure) await disableForFailure("open", opening.token);
+        else await disableAfterAbort(opening.token);
         return null;
       } finally {
         if (pendingOpen === opening) pendingOpen = null;
@@ -738,6 +755,24 @@ export function createEmbeddedSubtitleController(
     }
   };
 
+  const discoverTracks = async (reportOpenFailure: boolean) => {
+    if (destroyed || !source) return [];
+    const token = generation;
+    const record = await ensureSession(token, reportOpenFailure);
+    // A startup seek can move an in-flight open into a newer cue generation.
+    // Accept it only when it became the live session for the unchanged source.
+    if (
+      !record ||
+      destroyed ||
+      record !== sessionRecord ||
+      !source ||
+      !sourcesEqual(record.source, source)
+    )
+      return [];
+    syncTracksFromSession(record);
+    return tracks.slice();
+  };
+
   const controller: EmbeddedSubtitleController = {
     get tracks() {
       return tracks.slice();
@@ -748,12 +783,7 @@ export function createEmbeddedSubtitleController(
     },
 
     async discover() {
-      if (destroyed || !source) return [];
-      const token = generation;
-      const record = await ensureSession(token);
-      if (!record || !isCurrent(token)) return [];
-      syncTracksFromSession(record);
-      return tracks.slice();
+      return discoverTracks(true);
     },
 
     async updateSource(nextSource) {
@@ -776,6 +806,8 @@ export function createEmbeddedSubtitleController(
       const hadTracks = tracks.length > 0;
       const invalidation = invalidateWork(true, 0);
       source = nextSource ? { ...nextSource } : null;
+      discoveryRetryAt = 0;
+      discoveryAttempts = 0;
       selectedTrack = null;
       tracks = [];
       rendererSetActive(false);
@@ -827,7 +859,7 @@ export function createEmbeddedSubtitleController(
     async disable() {
       if (destroyed) return;
       const hadSelection = selectedTrack !== null;
-      const invalidation = invalidateWork(true);
+      const invalidation = invalidateWork(true, currentTime(), false);
       selectedTrack = null;
       rendererSetActive(false);
       if (hadSelection) notifySelectionChanged();
@@ -835,7 +867,24 @@ export function createEmbeddedSubtitleController(
     },
 
     async handleTimeUpdate() {
-      if (destroyed || !selectedTrack) return;
+      if (destroyed || !source) return;
+      if (
+        tracks.length === 0 &&
+        !pendingOpen &&
+        discoveryAttempts < MAX_DISCOVERY_ATTEMPTS
+      ) {
+        const nowMs = Date.now();
+        if (nowMs >= discoveryRetryAt) {
+          discoveryRetryAt = nowMs + DISCOVERY_RETRY_DELAY_MS;
+          discoveryAttempts += 1;
+          try {
+            await discoverTracks(false);
+          } catch {
+            // Recovery is fail-open and must never surface a user-visible failure.
+          }
+        }
+      }
+      if (!selectedTrack) return;
       const token = generation;
       const now = currentTime();
       reconcileDelivery(now, token);
@@ -850,15 +899,10 @@ export function createEmbeddedSubtitleController(
       const normalizedTimestamp =
         Number.isFinite(timestampSeconds) && timestampSeconds >= 0 ? timestampSeconds : 0;
       // Subtitle tracks are file-level metadata and are independent of the
-      // playback position, so a seek only rewinds cue state. Destroying the
-      // demux session here forced a full re-discovery on every seek and made
-      // subtitles disappear after a few seconds.
-      const preserveSession = sessionRecord !== null;
-      const invalidation = invalidateWork(
-        !preserveSession,
-        normalizedTimestamp,
-        !preserveSession
-      );
+      // playback position, so a seek only rewinds cue state. Startup room sync
+      // can seek before discovery finishes; aborting that open previously
+      // stranded the controller permanently with zero tracks.
+      const invalidation = invalidateWork(false, normalizedTimestamp, false);
       const token = invalidation.token;
       await invalidation.cleanup;
       if (!trackId || !isCurrent(token)) return false;
@@ -883,6 +927,8 @@ export function createEmbeddedSubtitleController(
       if (destroyPromise) return destroyPromise;
       destroyed = true;
       generation += 1;
+      discoveryRetryAt = 0;
+      discoveryAttempts = 0;
       destroyPromise = Promise.resolve().then(async () => {
         const pendingPromise = cancelPendingOpen();
         const sessionCleanup = detachSession();

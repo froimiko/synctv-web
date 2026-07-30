@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createEmbeddedSubtitleController, type EmbeddedSubtitleFailure } from "../controller";
+import {
+  createEmbeddedSubtitleController,
+  type EmbeddedSubtitleFailure,
+  type EmbeddedSubtitleSessionOpener
+} from "../controller";
 import type { EmbeddedSubtitleRenderer } from "../render";
 import type {
   EmbeddedSubtitlePacket,
@@ -122,6 +126,12 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function abortError(): Error {
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
+}
+
 async function waitFor(predicate: () => boolean): Promise<void> {
   for (let index = 0; index < 20; index += 1) {
     if (predicate()) return;
@@ -218,6 +228,33 @@ describe("embedded subtitle controller", () => {
     expect(controller.selectedTrack).toBeNull();
   });
 
+  it("lets a pending discovery settle stale after disable without leaking its session", async () => {
+    const pendingSession = deferred<MatroskaDemuxSession>();
+    const session = fakeSession();
+    const openSession = vi.fn<EmbeddedSubtitleSessionOpener>(({ signal }) => {
+      signal.addEventListener("abort", () => pendingSession.reject(abortError()), { once: true });
+      return pendingSession.promise;
+    });
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession,
+      renderer: renderer(),
+      getCurrentTime: () => 0
+    });
+
+    const discovery = controller.discover();
+    await waitFor(() => openSession.mock.calls.length === 1);
+    const discoverySignal = openSession.mock.calls[0]![0].signal;
+
+    await controller.disable();
+    expect(discoverySignal.aborted).toBe(false);
+
+    pendingSession.resolve(session);
+    await expect(discovery).resolves.toEqual([]);
+    expect(session.destroy).toHaveBeenCalledTimes(1);
+    expect(controller.tracks).toEqual([]);
+  });
+
   it("accumulates scan progress and passes remaining byte and packet budgets", async () => {
     const subtitleTrack = track();
     const session = fakeSession(subtitleTrack, [
@@ -268,9 +305,13 @@ describe("embedded subtitle controller", () => {
         ...progress
       } as MatroskaDemuxReadResult;
       const session = fakeSession(subtitleTrack, [malformedResult]);
+      const recoveredSession = fakeSession(subtitleTrack);
       const output = renderer();
       const failures: EmbeddedSubtitleFailure[] = [];
-      const openSession = vi.fn(async () => session);
+      const openSession = vi
+        .fn<EmbeddedSubtitleSessionOpener>()
+        .mockResolvedValueOnce(session)
+        .mockResolvedValueOnce(recoveredSession);
       const controller = createEmbeddedSubtitleController({
         source: SOURCE_A,
         openSession,
@@ -293,8 +334,10 @@ describe("embedded subtitle controller", () => {
       expect(controller.selectedTrack).toBeNull();
 
       await controller.handleTimeUpdate();
-      expect(openSession).toHaveBeenCalledTimes(1);
+      expect(openSession).toHaveBeenCalledTimes(2);
       expect(session.read).toHaveBeenCalledTimes(1);
+      expect(controller.tracks).toEqual([subtitleTrack]);
+      expect(failures).toHaveLength(1);
     }
   );
 
@@ -537,6 +580,177 @@ describe("embedded subtitle controller", () => {
     paused = false;
     await controller.handleTimeUpdate();
     expect(session.read).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not abort an in-flight discovery when startup room sync seeks", async () => {
+    const pendingSession = deferred<MatroskaDemuxSession>();
+    const session = fakeSession();
+    const openSession = vi.fn<EmbeddedSubtitleSessionOpener>(() => pendingSession.promise);
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession,
+      renderer: renderer(),
+      getCurrentTime: () => 0
+    });
+
+    const discovery = controller.discover();
+    await waitFor(() => openSession.mock.calls.length === 1);
+    const discoverySignal = openSession.mock.calls[0]![0].signal;
+
+    await expect(controller.handleSeek(30)).resolves.toBe(false);
+    expect(discoverySignal.aborted).toBe(false);
+
+    pendingSession.resolve(session);
+    await expect(discovery).resolves.toEqual([track()]);
+    expect(openSession).toHaveBeenCalledTimes(1);
+    expect(controller.tracks).toEqual([track()]);
+  });
+
+  it("recovers tracks on timeupdate after an aborted discovery", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      const session = fakeSession();
+      const failures: EmbeddedSubtitleFailure[] = [];
+      const openSession = vi
+        .fn<EmbeddedSubtitleSessionOpener>()
+        .mockRejectedValueOnce(abortError())
+        .mockResolvedValueOnce(session);
+      const controller = createEmbeddedSubtitleController({
+        source: SOURCE_A,
+        openSession,
+        renderer: renderer(),
+        getCurrentTime: () => 0,
+        onFailure: (failure) => failures.push(failure)
+      });
+
+      await expect(controller.discover()).resolves.toEqual([]);
+      vi.setSystemTime(2_000);
+      await controller.handleTimeUpdate();
+
+      expect(openSession).toHaveBeenCalledTimes(2);
+      expect(controller.tracks).toEqual([track()]);
+      expect(failures).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds automatic discovery recovery attempts", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      const openSession = vi.fn<EmbeddedSubtitleSessionOpener>(async () => {
+        throw abortError();
+      });
+      const controller = createEmbeddedSubtitleController({
+        source: SOURCE_A,
+        openSession,
+        renderer: renderer(),
+        getCurrentTime: () => 0
+      });
+
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        vi.setSystemTime(attempt * 2_000);
+        await controller.handleTimeUpdate();
+      }
+      expect(openSession).toHaveBeenCalledTimes(5);
+
+      vi.setSystemTime(60_000);
+      await controller.handleTimeUpdate();
+      await controller.handleTimeUpdate();
+      expect(openSession).toHaveBeenCalledTimes(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry discovery while an open is already pending", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      const pendingSession = deferred<MatroskaDemuxSession>();
+      const session = fakeSession();
+      const openSession = vi.fn<EmbeddedSubtitleSessionOpener>(() => pendingSession.promise);
+      const controller = createEmbeddedSubtitleController({
+        source: SOURCE_A,
+        openSession,
+        renderer: renderer(),
+        getCurrentTime: () => 0
+      });
+
+      const firstUpdate = controller.handleTimeUpdate();
+      await waitFor(() => openSession.mock.calls.length === 1);
+
+      for (let attempt = 1; attempt <= 4; attempt += 1) {
+        vi.setSystemTime(attempt * 2_000);
+        await controller.handleTimeUpdate();
+      }
+      expect(openSession).toHaveBeenCalledTimes(1);
+
+      pendingSession.resolve(session);
+      await firstUpdate;
+      expect(controller.tracks).toEqual([track()]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resets the discovery retry budget when the real source changes", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      const openSession = vi.fn<EmbeddedSubtitleSessionOpener>(async () => {
+        throw abortError();
+      });
+      const controller = createEmbeddedSubtitleController({
+        source: SOURCE_A,
+        openSession,
+        renderer: renderer(),
+        getCurrentTime: () => 0
+      });
+
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        vi.setSystemTime(attempt * 2_000);
+        await controller.handleTimeUpdate();
+      }
+      expect(openSession).toHaveBeenCalledTimes(5);
+
+      vi.setSystemTime(10_000);
+      await controller.updateSource(SOURCE_B);
+      expect(openSession).toHaveBeenCalledTimes(6);
+
+      vi.setSystemTime(12_000);
+      await controller.handleTimeUpdate();
+      expect(openSession).toHaveBeenCalledTimes(7);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("seeks an established session without destroying it", async () => {
+    const subtitleTrack = track();
+    const session = fakeSession(subtitleTrack);
+    const openSession = vi.fn(async () => session);
+    const controller = createEmbeddedSubtitleController({
+      source: SOURCE_A,
+      openSession,
+      renderer: renderer(),
+      getCurrentTime: () => 0
+    });
+
+    await controller.discover();
+    await controller.selectTrack(subtitleTrack.id);
+    session.seek.mockClear();
+
+    await expect(controller.handleSeek(37)).resolves.toBe(true);
+
+    expect(session.seek).toHaveBeenCalledWith(subtitleTrack.id, 37_000, {
+      backward: true,
+      anyFrame: true
+    });
+    expect(session.destroy).not.toHaveBeenCalled();
+    expect(openSession).toHaveBeenCalledTimes(1);
   });
 
   it("reuses the open session across forward and backward seeks", async () => {
