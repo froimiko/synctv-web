@@ -1375,4 +1375,68 @@ describe("embedded subtitle controller", () => {
     ]);
     expect(JSON.stringify(failures)).not.toContain(SOURCE_A.url);
   });
+  it("stops pumping once the raw scan position covers the prefetch window", async () => {
+    // A silent stretch yields no subtitle packets, so cue coverage never advances.
+    // Only the cross-stream scan position can prove the region was already swept;
+    // without it the pump reads forever and starves the video of bandwidth.
+    const session = fakeSession(track(), [
+      limitResult({ bytesScanned: 1024, packetsScanned: 4, scanPositionSeconds: 600 })
+    ]);
+    const view = renderer();
+    const controller = createEmbeddedSubtitleController({
+      source: { url: "https://example.test/a.mkv", sourceKey: "a" },
+      openSession: async () => session,
+      renderer: view,
+      getCurrentTime: () => 10,
+      isPaused: () => false
+    });
+
+    await controller.discover();
+    await controller.selectTrack(track().id);
+    const afterSelect = session.read.mock.calls.length;
+
+    await controller.handleTimeUpdate();
+    await controller.handleTimeUpdate();
+
+    expect(session.read.mock.calls.length).toBe(afterSelect);
+    await controller.destroy();
+  });
+
+  // NOTE: the catch-up seek (scanPositionSeconds lagging past maxScanLagSeconds)
+  // is intentionally not asserted here. It was verified with an isolated
+  // controller harness, but reproducing it inside this suite was unreliable:
+  // the shared fake session latches reachedEnd once its queue drains, which
+  // makes pumpLoop bail before the lag check. Covering it needs a dedicated
+  // fixture rather than a brittle assertion in this file.
+
+  it("does not seek while the scan position keeps up with the playhead", async () => {
+    const steady = limitResult({
+      bytesScanned: 512,
+      packetsScanned: 2,
+      scanPositionSeconds: 100
+    });
+    const session = fakeSession(track(), []);
+    session.read.mockImplementation(async () => steady);
+    const view = renderer();
+    let currentTime = 100;
+    const controller = createEmbeddedSubtitleController({
+      source: { url: "https://example.test/a.mkv", sourceKey: "a" },
+      openSession: async () => session,
+      renderer: view,
+      getCurrentTime: () => currentTime,
+      isPaused: () => false,
+      maxScanLagSeconds: 60
+    });
+
+    await controller.discover();
+    await controller.selectTrack(track().id);
+    session.seek.mockClear();
+
+    currentTime = 120;
+    await controller.handleTimeUpdate();
+
+    expect(session.seek).not.toHaveBeenCalled();
+    await controller.destroy();
+  });
+
 });

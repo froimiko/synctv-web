@@ -63,6 +63,8 @@ export interface EmbeddedSubtitleControllerOptions {
    * is established or the source is invalidated.
    */
   maxBytesScannedPerSession?: number;
+  /** Lag past which the scanner jumps to the playhead instead of reading on. */
+  maxScanLagSeconds?: number;
 }
 
 export interface EmbeddedSubtitleController {
@@ -130,6 +132,10 @@ const DEFAULT_MAX_PACKETS_PER_PUMP = 128;
 const DEFAULT_MAX_BYTES_SCANNED_PER_PUMP = 24 * 1024 * 1024;
 const DEFAULT_MAX_PACKETS_SCANNED_PER_PUMP = 16384;
 const DEFAULT_MAX_BYTES_SCANNED_PER_SESSION = 512 * 1024 * 1024;
+// Sequentially grinding through every intervening video packet can never catch
+// up while the video element is buffering the same file; past this lag the
+// scanner seeks to the playhead and abandons the skipped cues instead.
+const DEFAULT_MAX_SCAN_LAG_SECONDS = 60;
 const DISCOVERY_RETRY_DELAY_MS = 2000;
 const MAX_DISCOVERY_ATTEMPTS = 5;
 
@@ -202,6 +208,11 @@ export function createEmbeddedSubtitleController(
     )
   );
 
+  const maxScanLagSeconds = Math.max(
+    1,
+    positiveFinite(options.maxScanLagSeconds, DEFAULT_MAX_SCAN_LAG_SECONDS)
+  );
+
   let source = options.source ? { ...options.source } : null;
   let tracks: EmbeddedSubtitleTrack[] = [];
   let selectedTrack: EmbeddedSubtitleTrack | null = null;
@@ -218,6 +229,8 @@ export function createEmbeddedSubtitleController(
   let rendererResidentCueKeys = new Set<string>();
   let authoritativeDurationKeys = new Set<string>();
   let scanHorizonSeconds = 0;
+  // Real demux position across all streams; cue coverage stalls when silent.
+  let scanPositionSeconds = 0;
   let sessionBytesScanned = 0;
 
   let reachedEnd = false;
@@ -329,6 +342,7 @@ export function createEmbeddedSubtitleController(
     rendererResidentCueKeys = new Set<string>();
     authoritativeDurationKeys = new Set<string>();
     scanHorizonSeconds = timestampSeconds;
+    scanPositionSeconds = timestampSeconds;
     reachedEnd = false;
   };
 
@@ -633,12 +647,21 @@ export function createEmbeddedSubtitleController(
     if (!record || !isCurrent(token) || selectedTrack?.id !== trackId) return;
     reconcileDelivery(referenceTimeSeconds, token);
 
+    // At most one catch-up seek per pump, otherwise a moving playhead loops.
+    let laggedSeekDone = false;
     let packetCount = 0;
     let bytesScanned = 0;
     let packetsScanned = 0;
     while (packetCount < maxPacketsPerPump) {
       if (!isCurrent(token) || selectedTrack?.id !== trackId || reachedEnd || isPaused()) return;
-      if (scanHorizonSeconds >= referenceTimeSeconds + prefetchSeconds) return;
+      // Either signal is enough: cue coverage proves subtitles are buffered, and
+      // raw scan position proves a silent region has already been swept.
+      if (
+        scanHorizonSeconds >= referenceTimeSeconds + prefetchSeconds ||
+        scanPositionSeconds >= referenceTimeSeconds + prefetchSeconds
+      ) {
+        return;
+      }
 
       const remainingBytes = maxBytesScannedPerPump - bytesScanned;
       const remainingPackets = maxPacketsScannedPerPump - packetsScanned;
@@ -647,6 +670,21 @@ export function createEmbeddedSubtitleController(
         // pump only and let the next timeupdate resume from the demux position.
         reconcileDelivery(referenceTimeSeconds, token);
         return;
+      }
+
+      if (
+        !laggedSeekDone &&
+        !reachedEnd &&
+        scanPositionSeconds > 0 &&
+        referenceTimeSeconds - scanPositionSeconds > maxScanLagSeconds
+      ) {
+        laggedSeekDone = true;
+        if (!(await seekSession(record, trackId, referenceTimeSeconds, token))) return;
+        if (!isCurrent(token) || selectedTrack?.id !== trackId) return;
+        resetCueState(referenceTimeSeconds);
+        scanPositionSeconds = referenceTimeSeconds;
+        scanHorizonSeconds = referenceTimeSeconds;
+        continue;
       }
 
       let result;
@@ -679,6 +717,13 @@ export function createEmbeddedSubtitleController(
       bytesScanned = accumulatedProgress.bytesScanned;
       packetsScanned = accumulatedProgress.packetsScanned;
       sessionBytesScanned += result.bytesScanned;
+      if (
+        typeof result.scanPositionSeconds === "number" &&
+        Number.isFinite(result.scanPositionSeconds) &&
+        result.scanPositionSeconds > scanPositionSeconds
+      ) {
+        scanPositionSeconds = result.scanPositionSeconds;
+      }
 
       if (result.status === "aborted") {
         await disableAfterAbort(token);
@@ -889,7 +934,12 @@ export function createEmbeddedSubtitleController(
       const now = currentTime();
       reconcileDelivery(now, token);
       if (!isCurrent(token) || isPaused() || reachedEnd) return;
-      if (scanHorizonSeconds - now > lowWaterSeconds) return;
+      if (
+        scanHorizonSeconds - now > lowWaterSeconds ||
+        scanPositionSeconds - now > lowWaterSeconds
+      ) {
+        return;
+      }
       await runPump(token, now);
     },
 

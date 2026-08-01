@@ -146,7 +146,11 @@ export function isValidMatroskaDemuxReadProgress(
     candidate.bytesScanned >= 0 &&
     typeof candidate.packetsScanned === "number" &&
     Number.isSafeInteger(candidate.packetsScanned) &&
-    candidate.packetsScanned >= 0
+    candidate.packetsScanned >= 0 &&
+    (candidate.scanPositionSeconds === undefined ||
+      (typeof candidate.scanPositionSeconds === "number" &&
+        Number.isFinite(candidate.scanPositionSeconds) &&
+        candidate.scanPositionSeconds >= 0))
   );
 }
 
@@ -658,6 +662,16 @@ export async function openMatroskaDemuxWithRuntime(
           const limits = resolveMatroskaDemuxReadOptions(readOptions);
           const startPosition = sessionReader.getPos();
           let packetsScanned = 0;
+          // Advances on ANY stream: during a silent stretch the subtitle track
+          // yields nothing, so only cross-stream timestamps reveal real progress.
+          let scanPositionSeconds: number | undefined;
+          const notePacketPosition = (view: { pts: bigint; timeBase: SubtitleTimeBase }): void => {
+            const seconds = timestampToSeconds(view.pts, view.timeBase);
+            if (seconds === null || !Number.isFinite(seconds) || seconds < 0) return;
+            if (scanPositionSeconds === undefined || seconds > scanPositionSeconds) {
+              scanPositionSeconds = seconds;
+            }
+          };
           const progress = (): MatroskaDemuxReadProgress => {
             const bytesScanned = sessionReader.getPos() - startPosition;
             if (bytesScanned < 0n || bytesScanned > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -665,7 +679,8 @@ export async function openMatroskaDemuxWithRuntime(
             }
             const currentProgress = {
               bytesScanned: Number(bytesScanned),
-              packetsScanned
+              packetsScanned,
+              scanPositionSeconds
             };
             if (!isValidMatroskaDemuxReadProgress(currentProgress)) {
               throw new Error("Invalid Matroska demux read progress");
@@ -697,8 +712,9 @@ export async function openMatroskaDemuxWithRuntime(
             }
 
             packetsScanned += 1;
-            const packetProgress = progress();
             const packetView = runtime.viewPacket(sessionPacket);
+            notePacketPosition(packetView);
+            const packetProgress = progress();
             if (packetView.streamIndex === track.streamIndex) {
               const subtitlePacket = createEmbeddedSubtitlePacket({
                 sourceKey: options.sourceKey,

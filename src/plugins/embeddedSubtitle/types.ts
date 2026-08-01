@@ -102,6 +102,14 @@ export interface MatroskaDemuxReadProgress {
   bytesScanned: number;
   /** Non-negative safe integer count of all packets demuxed by this read call. */
   packetsScanned: number;
+  /**
+   * Timeline position of the newest packet inspected by this read call, across
+   * every stream rather than only the selected subtitle track. Cue coverage
+   * stalls during silent stretches, so this is the only honest signal of how
+   * far the scanner has actually advanced. Undefined when no packet carried a
+   * usable timestamp.
+   */
+  scanPositionSeconds?: number;
 }
 
 export interface MatroskaDiscoveryLimits {
