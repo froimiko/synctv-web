@@ -118,8 +118,10 @@ const FAILURE_DETAILS: Record<EmbeddedSubtitleFailureKind, EmbeddedSubtitleFailu
   }
 };
 
-const DEFAULT_PREFETCH_SECONDS = 30;
-const DEFAULT_LOW_WATER_SECONDS = 10;
+// The scanner must read ahead far enough to absorb request latency; a short
+// window let the playhead overtake it almost immediately on a real file.
+const DEFAULT_PREFETCH_SECONDS = 120;
+const DEFAULT_LOW_WATER_SECONDS = 45;
 const DEFAULT_RETAIN_BEHIND_SECONDS = 30;
 const DEFAULT_MAX_PACKETS_PER_PUMP = 128;
 // Matroska interleaves subtitle packets between video Clusters, so a sparse

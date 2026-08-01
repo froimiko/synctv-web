@@ -411,7 +411,7 @@ describe("Matroska discovery", () => {
 
     expect(bufferSizes).toHaveLength(1);
     expect(Number.isFinite(bufferSizes[0])).toBe(true);
-    expect(bufferSizes[0]).toBe(256 * 1024);
+    expect(bufferSizes[0]).toBe(4 * 1024 * 1024);
     await session.destroy();
   });
 

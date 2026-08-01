@@ -50,7 +50,9 @@ export class RangeSource {
 
   constructor(options: RangeSourceOptions) {
     this.url = options.url;
-    this.maxCacheBytes = options.maxCacheBytes ?? 10 * 1024 * 1024; // 默认10MB
+    // Must comfortably exceed the demuxer read buffer, otherwise every scanning
+    // read evicts the previous one and cached subranges stop paying off.
+    this.maxCacheBytes = options.maxCacheBytes ?? 32 * 1024 * 1024;
     this.customFetch =
       options.fetch ??
       (typeof window !== "undefined" ? window.fetch.bind(window) : globalThis.fetch);
