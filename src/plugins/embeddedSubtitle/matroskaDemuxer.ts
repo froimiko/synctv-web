@@ -42,11 +42,11 @@ export const MIN_SUBTITLE_CUE_DURATION_SECONDS = 0.001;
 const DEFAULT_READER_BUFFER_BYTES = 4 * 1024 * 1024;
 // Discovery only needs the header and the tail index, so it keeps issuing
 // small requests instead of pulling a full scanning buffer it would discard.
-const DISCOVERY_READ_CHUNK_BYTES = 256 * 1024;
+
 export const DEFAULT_DEMUX_READ_MAX_BYTES_SCANNED = 4 * 1024 * 1024;
 export const DEFAULT_DEMUX_READ_MAX_PACKETS_SCANNED = 512;
-export const DEFAULT_MATROSKA_DISCOVERY_MAX_BYTES = 8 * 1024 * 1024;
-export const DEFAULT_MATROSKA_DISCOVERY_MAX_MILLISECONDS = 10_000;
+export const DEFAULT_MATROSKA_DISCOVERY_MAX_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_MATROSKA_DISCOVERY_MAX_MILLISECONDS = 45_000;
 export const MATROSKA_DISCOVERY_LIMIT_ERROR = "Matroska discovery scan limit exceeded";
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
 
@@ -585,7 +585,7 @@ export async function openMatroskaDemuxWithRuntime(
       if (totalLength >= 0 && readPosition >= totalLength) return LIBMEDIA_IO_ERROR_END;
 
       const requestBytes = discoveryActive
-        ? Math.min(buffer.length, remainingDiscoveryBytes, DISCOVERY_READ_CHUNK_BYTES)
+        ? Math.min(buffer.length, remainingDiscoveryBytes)
         : buffer.length;
       const end =
         totalLength >= 0

@@ -133,6 +133,12 @@ const DEFAULT_MAX_PACKETS_PER_PUMP = 128;
 // actual runaway-download guard.
 const DEFAULT_MAX_BYTES_SCANNED_PER_PUMP = 24 * 1024 * 1024;
 const DEFAULT_MAX_PACKETS_SCANNED_PER_PUMP = 16384;
+// Subtitle packets are interleaved across the whole file, so a long film may
+// legitimately read most of it. Capping total bytes therefore scales wrongly:
+// 512 MiB is generous for a 1.4 GB film but only 5% of a 9.5 GB 4K one, which
+// silently disabled subtitles partway through. What distinguishes runaway
+// reading is bytes consumed WITHOUT the scan position advancing, so this is a
+// stall budget rather than a total budget.
 const DEFAULT_MAX_BYTES_SCANNED_PER_SESSION = 512 * 1024 * 1024;
 // Sequentially grinding through every intervening video packet can never catch
 // up while the video element is buffering the same file; past this lag the
@@ -233,6 +239,10 @@ export function createEmbeddedSubtitleController(
   let scanHorizonSeconds = 0;
   // Real demux position across all streams; cue coverage stalls when silent.
   let scanPositionSeconds = 0;
+  // Byte count when the scan position last advanced. The runaway guard measures
+  // bytes read since then, so a long film may read far more than the ceiling in
+  // total as long as it keeps making progress along the timeline.
+  let lastProductiveScanBytes = 0;
   let sessionBytesScanned = 0;
 
   let reachedEnd = false;
@@ -345,6 +355,7 @@ export function createEmbeddedSubtitleController(
     authoritativeDurationKeys = new Set<string>();
     scanHorizonSeconds = timestampSeconds;
     scanPositionSeconds = timestampSeconds;
+    lastProductiveScanBytes = sessionBytesScanned;
     reachedEnd = false;
   };
 
@@ -725,6 +736,7 @@ export function createEmbeddedSubtitleController(
         result.scanPositionSeconds > scanPositionSeconds
       ) {
         scanPositionSeconds = result.scanPositionSeconds;
+        lastProductiveScanBytes = sessionBytesScanned;
       }
 
       if (result.status === "aborted") {
@@ -737,7 +749,7 @@ export function createEmbeddedSubtitleController(
         reconcileDelivery(referenceTimeSeconds, token);
         return;
       }
-      if (sessionBytesScanned >= maxBytesScannedPerSession) {
+      if (sessionBytesScanned - lastProductiveScanBytes >= maxBytesScannedPerSession) {
         // Cumulative session scanning is the real runaway-download guard and is
         // the only scan-budget condition that disables embedded subtitles.
         await disableForFailure("scanBudget", token);
